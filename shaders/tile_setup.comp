@@ -1,0 +1,24 @@
+#version 460
+// Tile rasterizer, one thread: clamp the number of (tile, splat) entries to the buffer
+// capacity, record the overflow, and write the indirect dispatch arguments of the
+// tile-ranges pass (one thread per entry). The sort reads `entries` as its count.
+#extension GL_GOOGLE_include_directive : require
+#include "tile_common.glsl"
+
+layout(local_size_x = 1) in;
+
+layout(std430, set = 0, binding = 0) buffer Control { TILE_CONTROL_MEMBERS } control;
+
+layout(push_constant) uniform PushConstants {
+    uint capacity;  // entries the duplicated list can hold
+} pc;
+
+void main() {
+    uint m = control.duplicates;
+    uint entries = min(m, pc.capacity);
+    control.entries = entries;
+    control.overflow = m - entries;
+    control.rangesGroupsX = (entries + TILE_RANGES_WG_SIZE - 1u) / TILE_RANGES_WG_SIZE;
+    control.rangesGroupsY = 1u;
+    control.rangesGroupsZ = 1u;
+}

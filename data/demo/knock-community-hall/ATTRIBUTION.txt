@@ -1,0 +1,24 @@
+Knock Community Hall
+by scbenoit (https://superspl.at/user?id=scbenoit)
+Source: https://superspl.at/scene/0ff2e6dc
+        (file used: knock-community-hall.sog from the PlayCanvas engine repository,
+        https://github.com/playcanvas/engine/blob/289bc2b0f93b3d023cefdbe062976b97c97ea4b9/examples/assets/splats/knock-community-hall.sog,
+        with its license file knock-community-hall.txt)
+License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+         https://creativecommons.org/licenses/by/4.0/
+
+Modifications: converted from SOG to 3DGS PLY and decimated to 300000 gaussians
+(from 1935100) with @playcanvas/splat-transform v3.10.0 (`--decimate 300000 -g cpu`);
+PLY properties reordered to the standard INRIA 3DGS order (values unchanged) and gzipped.
+Reproduce with tools/demo/make_demo_scene.ps1 (see docs/web/DEMO_SCENE.md).
+
+No endorsement by the author is implied. The original license file reads:
+
+  Model Information:
+  * title:	Knock Community Hall
+  * source:	https://superspl.at/scene/0ff2e6dc
+  * author:	scbenoit (https://superspl.at/user?id=scbenoit)
+
+  Model License:
+  * license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+  * requirements:	Author must be credited. Commercial use is allowed.

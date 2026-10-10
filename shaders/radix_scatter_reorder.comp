@@ -1,0 +1,148 @@
+#version 460
+// Radix sort pass, step 3 "scatter", IMPROVED VARIANT (GpuRadixSort::Variant::Reorder,
+// `--radix-variant reorder`). Same result as radix_scatter.comp (the reference
+// implementation), bit for bit. Two changes:
+//
+// 1. Ranking per subgroup. radix_scatter.comp walks the block in 8 workgroup-wide rounds
+//    with 4 workgroup barriers each. Here subgroup s owns the CONTIGUOUS range
+//    [s * 256, s * 256 + 256) of the block and ranks it alone (8 rounds of 32 keys for a
+//    32-wide subgroup), with a running per-digit count in its own row sCounts[s][*] and
+//    only subgroupBarrier()s between rounds. One workgroup step then turns the rows into
+//    offsets (exclusive prefix over s, per digit). Subgroup s's keys all precede
+//    subgroup s+1's in the input, so the order is still the input order (stable).
+//
+// 2. Coalesced writes (the change that matters). Writing each key straight to its global
+//    slot sends the 32 lanes of a subgroup to up to 32 different digit buckets: every
+//    4-byte store touches its own 32-byte memory sector, so the scatter runs far below the
+//    memory bandwidth. Instead the block is first sorted LOCALLY by digit in shared memory
+//    (local position = keys of the block with a smaller digit + same digit before me),
+//    then thread j of the workgroup writes local element j, j + 256, ... For consecutive
+//    local elements with the same digit the global slots are consecutive too:
+//        dst = sDigitOffset[d] + (j - sBlockDigitStart[d])
+//    so each digit's run is written as one contiguous segment.
+#extension GL_GOOGLE_include_directive : require
+#include "radix_sort_common.glsl"
+
+layout(local_size_x = SORT_WG_SIZE) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer KeysIn { uint keysIn[]; };
+layout(std430, set = 0, binding = 1) readonly buffer ValuesIn { uint valuesIn[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer KeysOut { uint keysOut[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer ValuesOut { uint valuesOut[]; };
+layout(std430, set = 0, binding = 4) readonly buffer BlockHist { uint blockHist[]; };
+layout(std430, set = 0, binding = 5) readonly buffer DigitCounts { uint digitCounts[]; };
+layout(std430, set = 0, binding = 6) readonly buffer Args { SortArgs args; };
+#ifdef GSR_KEY64
+layout(std430, set = 0, binding = 8) readonly buffer KeysHiIn { uint keysHiIn[]; };
+layout(std430, set = 0, binding = 9) writeonly buffer KeysHiOut { uint keysHiOut[]; };
+shared uint sKeysHi[SORT_BLOCK_SIZE];
+#endif
+
+shared uint sDigitOffset[RADIX_SIZE];             // global slot of this block's first key per digit
+shared uint sBlockDigitStart[RADIX_SIZE];         // local slot of this block's first key per digit
+shared uint sCounts[kMaxSubgroups * RADIX_SIZE];  // [subgroup][digit]: running count, then offset
+shared uint sKeys[SORT_BLOCK_SIZE];               // the block, sorted locally by digit
+shared uint sValues[SORT_BLOCK_SIZE];
+
+uvec4 matchDigit(uint digit, bool valid) {
+    uvec4 peers = subgroupBallot(valid);
+    for (uint b = 0u; b < RADIX_BITS; ++b) {
+        bool bit = ((digit >> b) & 1u) != 0u;
+        uvec4 vote = subgroupBallot(bit);
+        peers &= bit ? vote : ~vote;
+    }
+    return peers;
+}
+
+void main() {
+    uint lane = linearLane();
+    uint block = gl_WorkGroupID.x;
+    uint count = args.count;
+    uint numBlocks = args.numBlocks;
+    uint blockStart = block * SORT_BLOCK_SIZE;
+    uint blockCount = min(count - blockStart, SORT_BLOCK_SIZE);  // keys in this block
+
+    uint total;
+    uint digitStart = workgroupExclusiveScan(digitCounts[lane], total);
+    sDigitOffset[lane] = digitStart + blockHist[lane * numBlocks + block];
+    for (uint s = 0u; s < gl_NumSubgroups; ++s) sCounts[s * RADIX_SIZE + lane] = 0u;
+    barrier();
+
+    // Phase 1: each subgroup ranks its own contiguous range, round by round.
+    uint mine = gl_SubgroupID * RADIX_SIZE;  // this subgroup's row of sCounts
+    uint first = gl_SubgroupID * gl_SubgroupSize * SORT_ITEMS_PER_THREAD;  // block-local
+    uint keys[SORT_ITEMS_PER_THREAD];
+    uint values[SORT_ITEMS_PER_THREAD];
+    uint ranks[SORT_ITEMS_PER_THREAD];
+#ifdef GSR_KEY64
+    uint keysHi[SORT_ITEMS_PER_THREAD];
+#endif
+    for (uint i = 0u; i < SORT_ITEMS_PER_THREAD; ++i) {
+        uint local = first + i * gl_SubgroupSize + gl_SubgroupInvocationID;
+        bool valid = local < blockCount;
+        keys[i] = valid ? keysIn[blockStart + local] : 0u;
+        values[i] = valid ? valuesIn[blockStart + local] : 0u;
+#ifdef GSR_KEY64
+        keysHi[i] = valid ? keysHiIn[blockStart + local] : 0u;
+        uint digit = digitOf64(keys[i], keysHi[i]);
+#else
+        uint digit = digitOf(keys[i]);
+#endif
+        uvec4 peers = matchDigit(digit, valid);
+        uint below = subgroupBallotExclusiveBitCount(peers);
+        uint before = sCounts[mine + digit];  // digit-d keys of my subgroup in earlier rounds
+        ranks[i] = before + below;
+        subgroupBarrier();  // every peer has read `before` ...
+        if (valid && below == 0u) sCounts[mine + digit] = before + subgroupBallotBitCount(peers);
+        subgroupBarrier();  // ... before the next round reads the updated count
+    }
+    barrier();
+
+    // Phase 2: per digit (thread `lane` owns digit `lane`): counts -> exclusive offsets over
+    // subgroups, and the block's own digit histogram -> local digit starts.
+    uint inBlock = 0u;
+    for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+        uint c = sCounts[s * RADIX_SIZE + lane];
+        sCounts[s * RADIX_SIZE + lane] = inBlock;
+        inBlock += c;
+    }
+    uint blockTotal;
+    sBlockDigitStart[lane] = workgroupExclusiveScan(inBlock, blockTotal);
+    barrier();  // sBlockDigitStart (and the sCounts offsets) visible to every thread
+
+    // Phase 3: local sort into shared memory.
+    for (uint i = 0u; i < SORT_ITEMS_PER_THREAD; ++i) {
+        uint local = first + i * gl_SubgroupSize + gl_SubgroupInvocationID;
+        if (local < blockCount) {
+#ifdef GSR_KEY64
+            uint digit = digitOf64(keys[i], keysHi[i]);
+#else
+            uint digit = digitOf(keys[i]);
+#endif
+            uint pos = sBlockDigitStart[digit] + sCounts[mine + digit] + ranks[i];
+            sKeys[pos] = keys[i];
+            sValues[pos] = values[i];
+#ifdef GSR_KEY64
+            sKeysHi[pos] = keysHi[i];
+#endif
+        }
+    }
+    barrier();
+
+    // Phase 4: coalesced global writes, consecutive threads -> consecutive local slots.
+    for (uint j = lane; j < blockCount; j += SORT_WG_SIZE) {
+        uint key = sKeys[j];
+#ifdef GSR_KEY64
+        uint keyHi = sKeysHi[j];
+        uint digit = digitOf64(key, keyHi);
+#else
+        uint digit = digitOf(key);
+#endif
+        uint dst = sDigitOffset[digit] + (j - sBlockDigitStart[digit]);
+        keysOut[dst] = key;
+        valuesOut[dst] = sValues[j];
+#ifdef GSR_KEY64
+        keysHiOut[dst] = keyHi;
+#endif
+    }
+}

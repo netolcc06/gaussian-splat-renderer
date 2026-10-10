@@ -1,0 +1,24 @@
+#version 460
+// Prefix sum, step 2: ONE workgroup turns blockSums into its exclusive prefix sum in place
+// (blockSums[b] = sum of all elements in blocks 0 .. b-1) and writes the grand total to
+// totalOut[totalOffset]. Any number of blocks: chunks of SCAN_WG_SIZE with a carried
+// running total (16M elements = 8192 blocks = 32 chunks). See scan_common.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "scan_common.glsl"
+
+layout(local_size_x = SCAN_WG_SIZE) in;
+
+void main() {
+    uint numBlocks = scanNumBlocks(scanCount());
+    uint lane = linearLane();
+    uint running = 0u;
+    for (uint chunk = 0u; chunk < numBlocks; chunk += SCAN_WG_SIZE) {
+        uint b = chunk + lane;
+        uint v = b < numBlocks ? blockSums[b] : 0u;
+        uint chunkTotal;
+        uint before = workgroupExclusiveScan(v, chunkTotal);
+        if (b < numBlocks) blockSums[b] = running + before;
+        running += chunkTotal;
+    }
+    if (lane == 0u) totalOut[pc.totalOffset] = running;  // 0 for an empty input
+}

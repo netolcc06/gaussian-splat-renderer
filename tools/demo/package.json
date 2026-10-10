@@ -1,0 +1,8 @@
+{
+  "name": "gsplat-demo-scene-tools",
+  "private": true,
+  "description": "Pinned PlayCanvas splat-transform used by make_demo_scene.ps1 to convert the web demo scene",
+  "devDependencies": {
+    "@playcanvas/splat-transform": "3.10.0"
+  }
+}

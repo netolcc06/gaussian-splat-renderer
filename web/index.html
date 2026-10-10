@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gaussian Splat Renderer (WebGPU)</title>
+  <meta name="description" content="A 3D Gaussian Splatting renderer in C++ compiled to WebAssembly, rendering with a WebGPU compute tile rasterizer.">
+  <link rel="icon" href="data:,">  <!-- no favicon request (a 404 would count as a console error) -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app">
+    <canvas id="canvas" aria-label="Renderer output"></canvas>
+
+    <aside id="toolbar" class="panel" hidden>
+      <header class="panel-head">
+        <h1>Gaussian Splat Renderer</h1>
+        <button id="panel-toggle" class="icon-button" type="button" aria-expanded="true" title="Hide panel">&#x2212;</button>
+      </header>
+      <div id="panel-body">
+        <section>
+          <h2>Scene</h2>
+          <div class="row wrap">
+            <button id="demo-knock" class="button" type="button">Demo: Knock Community Hall <small>(25 MB)</small></button>
+            <button id="demo-grid" class="button secondary" type="button">Synthetic grid</button>
+          </div>
+          <div class="row wrap">
+            <label class="button secondary">Open .ply&hellip;<input id="file-input" type="file" accept=".ply,.gz,.json" multiple hidden></label>
+            <span class="hint">or drop a file. Your file never leaves your browser. Add a <code>cameras.json</code> to get training cameras.</span>
+          </div>
+          <div id="progress" class="progress" hidden><div id="progress-bar"></div></div>
+        </section>
+
+        <section>
+          <h2>Rendering</h2>
+          <label class="row">Renderer
+            <select id="opt-renderer">
+              <option value="splat-tiles">Gaussian splats (compute tiles)</option>
+              <option value="points">Points (debug)</option>
+            </select>
+          </label>
+          <label class="row">SH degree
+            <select id="opt-sh">
+              <option value="3">3 (full)</option><option value="2">2</option><option value="1">1</option><option value="0">0 (no view dependence)</option>
+            </select>
+          </label>
+          <label class="row" id="row-camera" hidden>Training camera
+            <select id="opt-camera"></select>
+          </label>
+          <div class="row wrap">
+            <button id="reset-camera" class="button secondary" type="button">Reset view</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Stats</h2>
+          <dl id="stats" class="stats"></dl>
+        </section>
+
+        <section class="help">
+          <h2>Controls</h2>
+          <p>Drag: orbit &middot; Right/Shift-drag or two fingers: pan &middot; Wheel or pinch: zoom &middot; Double-click: reset</p>
+        </section>
+
+        <section id="credits" class="credits">
+          <h2>About</h2>
+          <p>C++ compiled to WebAssembly (Emscripten) with a WebGPU compute tile rasterizer, a port of a
+            Vulkan 3D Gaussian Splatting renderer. Rendering follows Kerbl et&nbsp;al., <em>3D Gaussian Splatting for
+            Real-Time Radiance Field Rendering</em> (SIGGRAPH 2023).</p>
+          <p id="credit-knock" hidden><strong>Demo scene:</strong> &ldquo;Knock Community Hall&rdquo; by
+            <a href="https://superspl.at/user?id=scbenoit" target="_blank" rel="noopener">scbenoit</a>
+            (<a href="https://superspl.at/scene/0ff2e6dc" target="_blank" rel="noopener">source</a>), licensed under
+            <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>.
+            Modified: converted from SOG to 3DGS PLY and decimated to 300,000 gaussians
+            (<a href="demo/knock-community-hall.ATTRIBUTION.txt" target="_blank">details</a>).</p>
+          <p class="small">WebGPU via Emscripten&rsquo;s emdawnwebgpu port (Dawn, BSD-3-Clause).</p>
+        </section>
+      </div>
+    </aside>
+
+    <div id="status" class="status">Starting WebGPU...</div>
+    <div id="drop-hint" class="drop-hint" hidden>Drop a .ply file</div>
+  </main>
+
+  <!-- Shown when WebGPU is not available; filled in by app.js before the wasm is downloaded. -->
+  <section id="unsupported" class="unsupported" hidden>
+    <h1>WebGPU is not available</h1>
+    <p>This renderer needs WebGPU. It runs in current Chrome and Edge (113+), Firefox 141+ on
+      Windows, and Safari 26+.</p>
+    <p class="detected">Detected: <span id="unsupported-reason"></span></p>
+    <p>In Chrome, <code>chrome://gpu</code> shows whether WebGPU is enabled for your GPU and driver.</p>
+  </section>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

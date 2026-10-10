@@ -1,0 +1,117 @@
+#version 460
+// Radix sort pass, step 3 "scatter" (a.k.a. downsweep): one workgroup per block moves
+// every key/value of its block to its sorted position for this digit:
+//
+//   dst = digitStart[d]            keys with a smaller digit (exclusive scan of digitCounts)
+//       + blockHist[d][block]      keys with digit d in earlier blocks (after radix_scan)
+//       + localRank                keys with digit d EARLIER IN THIS BLOCK
+//
+// localRank must respect the input order for the sort to be stable. The block is
+// processed in SORT_ITEMS_PER_THREAD rounds of 256 consecutive keys; in each round:
+//
+//   a) within a subgroup: "match" the lanes holding the same digit with 8 ballots (one
+//      per digit bit): peers = lanes whose digit equals mine. My rank among them is the
+//      number of peers in lower lanes (subgroupBallotExclusiveBitCount), and the lowest
+//      peer (rank 0) publishes the group size in sCounts[subgroup][d].
+//   b) across subgroups: thread t owns digit t and replaces sCounts[s][t] by the exclusive
+//      prefix over s (keys with digit t in earlier subgroups of this round).
+//   c) scatter: dst = sDigitOffset[d] + sCounts[subgroup][d] + rank.
+//   d) thread t advances sDigitOffset[t] by the round's count of digit t and clears
+//      sCounts for the next round.
+//
+// Rounds are processed in order, subgroups in order within a round and lanes in order
+// within a subgroup, i.e. exactly input order: equal digits never overtake each other.
+// Launched with vkCmdDispatchIndirect (groupsX = numBlocks).
+#extension GL_GOOGLE_include_directive : require
+#include "radix_sort_common.glsl"
+
+layout(local_size_x = SORT_WG_SIZE) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer KeysIn { uint keysIn[]; };
+layout(std430, set = 0, binding = 1) readonly buffer ValuesIn { uint valuesIn[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer KeysOut { uint keysOut[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer ValuesOut { uint valuesOut[]; };
+layout(std430, set = 0, binding = 4) readonly buffer BlockHist { uint blockHist[]; };
+layout(std430, set = 0, binding = 5) readonly buffer DigitCounts { uint digitCounts[]; };
+layout(std430, set = 0, binding = 6) readonly buffer Args { SortArgs args; };
+#ifdef GSR_KEY64
+layout(std430, set = 0, binding = 8) readonly buffer KeysHiIn { uint keysHiIn[]; };
+layout(std430, set = 0, binding = 9) writeonly buffer KeysHiOut { uint keysHiOut[]; };
+#endif
+
+shared uint sDigitOffset[RADIX_SIZE];             // next output slot of this block, per digit
+shared uint sCounts[kMaxSubgroups * RADIX_SIZE];  // [subgroup][digit], per round
+
+// Lanes of this subgroup whose `digit` equals mine (only lanes with valid == true).
+uvec4 matchDigit(uint digit, bool valid) {
+    uvec4 peers = subgroupBallot(valid);
+    for (uint b = 0u; b < RADIX_BITS; ++b) {
+        bool bit = ((digit >> b) & 1u) != 0u;
+        uvec4 vote = subgroupBallot(bit);
+        peers &= bit ? vote : ~vote;
+    }
+    return peers;
+}
+
+void main() {
+    uint lane = linearLane();
+    uint block = gl_WorkGroupID.x;
+    uint count = args.count;
+    uint numBlocks = args.numBlocks;
+
+    // Global start of digit `lane` (every block recomputes this 256-element scan; it is
+    // cheaper than another dispatch + barrier).
+    uint total;
+    uint digitStart = workgroupExclusiveScan(digitCounts[lane], total);
+    sDigitOffset[lane] = digitStart + blockHist[lane * numBlocks + block];
+    for (uint s = 0u; s < gl_NumSubgroups; ++s) sCounts[s * RADIX_SIZE + lane] = 0u;
+    barrier();
+
+    uint blockStart = block * SORT_BLOCK_SIZE;
+    for (uint round = 0u; round < SORT_ITEMS_PER_THREAD; ++round) {
+        uint roundStart = blockStart + round * SORT_WG_SIZE;
+        if (roundStart >= count) break;  // uniform across the workgroup
+
+        uint index = roundStart + lane;
+        bool valid = index < count;
+        uint key = valid ? keysIn[index] : 0u;
+        uint value = valid ? valuesIn[index] : 0u;
+#ifdef GSR_KEY64
+        uint keyHi = valid ? keysHiIn[index] : 0u;
+        uint digit = digitOf64(key, keyHi);
+#else
+        uint digit = digitOf(key);
+#endif
+
+        // a) rank within the subgroup
+        uvec4 peers = matchDigit(digit, valid);
+        uint rank = subgroupBallotExclusiveBitCount(peers);
+        if (valid && rank == 0u) sCounts[gl_SubgroupID * RADIX_SIZE + digit] = subgroupBallotBitCount(peers);
+        barrier();
+
+        // b) prefix across subgroups; thread `lane` owns digit `lane`
+        uint roundCount = 0u;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            uint c = sCounts[s * RADIX_SIZE + lane];
+            sCounts[s * RADIX_SIZE + lane] = roundCount;
+            roundCount += c;
+        }
+        barrier();
+
+        // c) scatter
+        if (valid) {
+            uint dst = sDigitOffset[digit] + sCounts[gl_SubgroupID * RADIX_SIZE + digit] + rank;
+            keysOut[dst] = key;
+            valuesOut[dst] = value;
+#ifdef GSR_KEY64
+            keysHiOut[dst] = keyHi;
+#endif
+        }
+        barrier();
+
+        // d) advance and reset for the next round
+        sDigitOffset[lane] += roundCount;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) sCounts[s * RADIX_SIZE + lane] = 0u;
+        barrier();
+    }
+}

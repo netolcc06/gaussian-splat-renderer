@@ -1,0 +1,13 @@
+{
+  "name": "gsplat-web-tools",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Automated checks for the WebGPU build (headless Chrome via puppeteer-core).",
+  "type": "module",
+  "scripts": {
+    "check": "node run_web_checks.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.12.0"
+  }
+}

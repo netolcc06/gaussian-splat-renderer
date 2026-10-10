@@ -1,0 +1,45 @@
+#version 460
+// Radix sort pass, step 1 "histogram" (a.k.a. upsweep / reduce): one workgroup per block
+// of SORT_BLOCK_SIZE keys counts how many keys of its block have each digit value, and
+// writes the 256 counts DIGIT-MAJOR: blockHist[digit * numBlocks + block]. Digit-major
+// means that the following scan, which needs "for this digit, how many keys in earlier
+// blocks", reads one contiguous row per digit.
+//
+// Order does not matter here (a count is a count), so this shader uses plain shared
+// atomics. Launched with vkCmdDispatchIndirect (groupsX = numBlocks).
+#extension GL_GOOGLE_include_directive : require
+#include "radix_sort_common.glsl"
+
+layout(local_size_x = SORT_WG_SIZE) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer KeysIn { uint keysIn[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer BlockHist { uint blockHist[]; };
+layout(std430, set = 0, binding = 6) readonly buffer Args { SortArgs args; };
+#ifdef GSR_KEY64
+layout(std430, set = 0, binding = 8) readonly buffer KeysHiIn { uint keysHiIn[]; };
+// Only the word that holds this pass's digit is read.
+uint digitAt(uint index) { return pc.shift >= 32u ? digitOf64(0u, keysHiIn[index]) : digitOf(keysIn[index]); }
+#else
+uint digitAt(uint index) { return digitOf(keysIn[index]); }
+#endif
+
+shared uint sHistogram[RADIX_SIZE];
+
+void main() {
+    uint lane = linearLane();
+    uint block = gl_WorkGroupID.x;
+    uint count = args.count;
+
+    sHistogram[lane] = 0u;  // SORT_WG_SIZE == RADIX_SIZE: one bucket per thread
+    barrier();
+
+    // Coalesced: in iteration i, the workgroup reads 256 consecutive keys.
+    uint first = block * SORT_BLOCK_SIZE + lane;
+    for (uint i = 0u; i < SORT_ITEMS_PER_THREAD; ++i) {
+        uint index = first + i * SORT_WG_SIZE;
+        if (index < count) atomicAdd(sHistogram[digitAt(index)], 1u);
+    }
+    barrier();
+
+    blockHist[lane * args.numBlocks + block] = sHistogram[lane];
+}

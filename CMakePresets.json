@@ -1,0 +1,30 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "native",
+      "displayName": "Native (Vulkan, Visual Studio 2022)",
+      "description": "Same as: cmake -S . -B build -G \"Visual Studio 17 2022\" -A x64",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build"
+    },
+    {
+      "name": "web",
+      "displayName": "Web (Emscripten + WebGPU, Ninja, Release)",
+      "description": "Needs an activated emsdk (EMSDK set) and ninja on PATH; see tools/web/build_web.ps1. Output: build-web/dist/",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-web",
+      "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "native-release", "configurePreset": "native", "configuration": "Release" },
+    { "name": "native-debug", "configurePreset": "native", "configuration": "Debug" },
+    { "name": "web", "configurePreset": "web" }
+  ]
+}

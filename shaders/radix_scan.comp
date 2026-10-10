@@ -1,0 +1,36 @@
+#version 460
+// Radix sort pass, step 2 "scan": one workgroup per digit d (256 workgroups). Turns
+// row d of blockHist (the count of digit d in every block) into its exclusive prefix
+// sum IN PLACE, so that afterwards
+//     blockHist[d * numBlocks + b] = number of keys with digit d in blocks 0 .. b-1,
+// and writes digitCounts[d] = number of keys with digit d overall. The scatter step adds
+// the exclusive scan of digitCounts (keys with a smaller digit) itself.
+//
+// The row is processed in chunks of 256 blocks with a carried running total, so any
+// number of blocks works (2M keys = 1024 blocks = 4 chunks).
+#extension GL_GOOGLE_include_directive : require
+#include "radix_sort_common.glsl"
+
+layout(local_size_x = SORT_WG_SIZE) in;
+
+layout(std430, set = 0, binding = 4) buffer BlockHist { uint blockHist[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer DigitCounts { uint digitCounts[]; };
+layout(std430, set = 0, binding = 6) readonly buffer Args { SortArgs args; };
+
+void main() {
+    uint lane = linearLane();
+    uint digit = gl_WorkGroupID.x;
+    uint numBlocks = args.numBlocks;
+    uint row = digit * numBlocks;
+
+    uint running = 0u;  // keys with this digit in the chunks already processed
+    for (uint chunk = 0u; chunk < numBlocks; chunk += SORT_WG_SIZE) {
+        uint b = chunk + lane;
+        uint count = b < numBlocks ? blockHist[row + b] : 0u;
+        uint chunkTotal;
+        uint before = workgroupExclusiveScan(count, chunkTotal);
+        if (b < numBlocks) blockHist[row + b] = running + before;
+        running += chunkTotal;
+    }
+    if (lane == 0u) digitCounts[digit] = running;
+}

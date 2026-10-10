@@ -1,0 +1,22 @@
+#version 460
+// Radix sort, step 0 (one thread): turn the GPU-side key count into indirect dispatch
+// arguments. The count was produced on the GPU (e.g. by the splat compaction's atomic
+// counter), so the CPU cannot know it when it records the command buffer:
+// vkCmdDispatchIndirect then launches exactly ceil(count / 2048) workgroups.
+#extension GL_GOOGLE_include_directive : require
+#include "radix_sort_common.glsl"
+
+layout(local_size_x = 1) in;
+
+layout(std430, set = 0, binding = 6) writeonly buffer Args { SortArgs args; };
+layout(std430, set = 0, binding = 7) readonly buffer CountSource { uint countSource[]; };
+
+void main() {
+    uint count = min(countSource[pc.countOffset], pc.maxCount);
+    uint blocks = (count + SORT_BLOCK_SIZE - 1u) / SORT_BLOCK_SIZE;
+    args.groupsX = blocks;  // 0 is a valid (empty) indirect dispatch
+    args.groupsY = 1u;
+    args.groupsZ = 1u;
+    args.count = count;
+    args.numBlocks = blocks;
+}

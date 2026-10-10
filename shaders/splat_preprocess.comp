@@ -1,0 +1,320 @@
+#version 460
+// Splat preprocess: one thread per gaussian, the INRIA preprocessCUDA.
+// Reads the scene buffers (GpuScene, see src/render/gpu_scene.h) and writes one Splat
+// (splat_common.glsl) per gaussian: pixel centre, conic, opacity, SH colour, radius,
+// view depth and a cull reason. The draw pass reads these through the sorted indices.
+//
+// Two builds of this file (CMakeLists.txt):
+//   splat_preprocess.comp.spv          Phase 2 `splat`: writes every gaussian's Splat; the
+//                                      CPU sorts and near-culls.
+//   splat_preprocess_compact.comp.spv  Phase 3 `splat-gpusort` (-DGSR_COMPACT): also culls
+//                                      gaussians whose alpha can never reach 1/255, and
+//                                      APPENDS each visible gaussian as (depth key, index)
+//                                      to a compact list with one atomic per subgroup
+//                                      (stream compaction), counts every cull reason, and
+//                                      writes Splats only for visible gaussians.
+//   splat_preprocess_tiles.comp.spv    Phase 4 `splat-tiles` (-DGSR_TILES): the same culling
+//                                      and cull counters as GSR_COMPACT, but instead of
+//                                      appending it writes, for EVERY gaussian i, the number
+//                                      of screen tiles its tile rectangle touches
+//                                      (tileCounts[i], 0 = culled). Prefix sums over that
+//                                      array (GpuScan) then place each splat's entries in
+//                                      index order, without atomics (see
+//                                      src/render/splat_tile_renderer.h).
+#extension GL_GOOGLE_include_directive : require
+#include "splat_common.glsl"
+#if defined(GSR_COMPACT) || defined(GSR_TILES)
+// Phase 3+ GPU culling: precise depth, opacity cull, cull counters (subgroup ballots).
+#define GSR_GPU_CULL
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#endif
+
+layout(local_size_x = 256) in;
+
+// Bindings 0-3: the scene, in any Phase 5 scene format (decoder + specialization constants
+// 0-6 in scene_decode.glsl; f32 soa = the Phase 1-4 arrays posAlpha/scales/rotations/sh).
+#include "scene_decode.glsl"
+layout(std430, set = 0, binding = 4) writeonly buffer Splats { Splat splats[]; };
+
+#ifdef GSR_COMPACT
+// The compact list: entry j = (key, index) of the j-th visible gaussian appended.
+layout(std430, set = 0, binding = 5) writeonly buffer SortKeys { uint sortKeys[]; };
+layout(std430, set = 0, binding = 6) writeonly buffer SortValues { uint sortValues[]; };
+// Control block (C++ twin: SplatControl in splat_gpusort_renderer.cpp). The first four
+// uints are a VkDrawIndirectCommand: instanceCount doubles as the append counter, so the
+// draw consumes the visible count without any extra pass.
+layout(std430, set = 0, binding = 7) buffer Control {
+    uint vertexCount;    // 6 (one quad)
+    uint instanceCount;  // number of entries appended to the compact list
+    uint firstVertex;
+    uint firstInstance;
+    uint cullCounts[8];  // this frame, per cull reason (kCull*), [0] = visible
+} control;
+#endif
+
+#ifdef GSR_TILES
+// Tiles touched by each gaussian's tile rectangle, 0 if culled (index order, all gaussians).
+layout(std430, set = 0, binding = 5) writeonly buffer TileCounts { uint tileCounts[]; };
+// Phase 5 packed render splats (render_splat.glsl, `--render-splat p32|p24`): the packed
+// record, the tile rectangle and the depth go to their own arrays (binding 4 is unused);
+// in full mode (Phase 4) only binding 4 (the 48-byte Splat) is written.
+#include "render_splat.glsl"
+#include "tile_common.glsl"    // kBoundsMode, kBinTileSize (Phase 6)
+#include "tile_coverage.glsl"
+layout(std430, set = 0, binding = 8) writeonly buffer RenderSplats4 { uvec4 renderSplats4[]; };  // p32: 2 per splat
+layout(std430, set = 0, binding = 9) writeonly buffer RenderSplats2 { uvec2 renderSplats2[]; };  // p24: 3 per splat
+layout(std430, set = 0, binding = 10) writeonly buffer Rects { uvec2 rects[]; };
+layout(std430, set = 0, binding = 11) writeonly buffer Depths { uint depths[]; };
+// Phase 6 StopThePop (`--sort-window K`): per gaussian, P = Sigma^-1 in INRIA camera space
+// and b = P mu (3 vec4), so the render pass can compute the depth of the gaussian's
+// maximum along each pixel's ray, t* = (v . b) / (v^T P v). Only with kFlagRayDepth.
+layout(std430, set = 0, binding = 12) writeonly buffer RayDepthParams { vec4 rayDepthParams[]; };
+
+void writeRenderSplat(uint i, Splat s, ivec4 rect) {
+    if (kRenderSplatMode == kRenderSplatFull) {
+        splats[i] = s;
+        return;
+    }
+    uint colorRadius = packColorRadius(s.color.b, s.radius);
+    if (kRenderSplatMode == kRenderSplatP32) {
+        renderSplats4[2u * i] = floatBitsToUint(vec4(s.center, s.conicOpacity.xy));
+        renderSplats4[2u * i + 1u] = uvec4(floatBitsToUint(s.conicOpacity.z), floatBitsToUint(s.conicOpacity.w),
+                                           packHalf2x16(s.color.rg), colorRadius);
+    } else {
+        renderSplats2[3u * i] = floatBitsToUint(s.center);
+        renderSplats2[3u * i + 1u] = encodeConicOpacityP24(s.conicOpacity);
+        renderSplats2[3u * i + 2u] = uvec2(packHalf2x16(s.color.rg), colorRadius);
+    }
+    rects[i] = packRect(rect);
+    depths[i] = floatBitsToUint(s.depth);
+}
+// Control block (C++ twin: TileControl in splat_tile_renderer.h); only the cull counters
+// are written here, at the same byte offset (16) as in the Phase 3 block.
+layout(std430, set = 0, binding = 7) buffer Control {
+    uint header[4];
+    uint cullCounts[8];  // this frame, per cull reason (kCull*), [0] = visible
+} control;
+#endif
+
+// C++ twin: PreprocessPushConstants in src/render/splat_renderer.cpp (116 bytes) and
+// in src/render/splat_gpusort_renderer.cpp (120 bytes, + flags).
+layout(push_constant) uniform PushConstants {
+    mat4 viewInria;    // data space -> INRIA camera space
+    vec4 camPos;       // xyz: camera centre in data space
+    vec2 focal;        // pixels
+    vec2 tanHalfFov;
+    uvec2 imageSize;   // pixels
+    uint count;        // gaussians
+    uint shCoeffs;     // K stored per gaussian (unused since Phase 5: kStoredCoeffs, scene_decode.glsl)
+    uint shDegree;     // bands to evaluate (<= stored degree)
+#ifdef GSR_GPU_CULL
+    uint flags;        // kFlag* below (GSR_COMPACT; GSR_TILES: kFlagRayDepth only)
+#endif
+} pc;
+
+#ifdef GSR_COMPACT
+const uint kFlagAppend = 1u;    // append visible gaussians to the compact list (a sorting frame)
+const uint kFlagWriteAll = 2u;  // write the Splat of culled gaussians too (frames that reuse an
+                                // older sorted list, whose entries may be culled by now)
+#endif
+#ifdef GSR_TILES
+const uint kFlagRayDepth = 4u;  // Phase 6: write rayDepthParams (StopThePop sort window)
+
+// Sigma^-1 = (W R S S R^T W^T)^-1 = (W R) S^-2 (W R)^T in camera space: no matrix inversion,
+// just the reciprocal squared scales (clamped so that a zero axis stays finite).
+void writeRayDepth(uint i, vec3 sigma, vec4 q, vec3 tCam) {
+    mat3 M = mat3(pc.viewInria) * quaternionToMatrix(q);  // columns: the gaussian's axes, camera space
+    float smax = max(sigma.x, max(sigma.y, sigma.z));
+    vec3 s = max(sigma, vec3(max(1e-4 * smax, 1e-12)));
+    vec3 w = 1.0 / (s * s);
+    mat3 P = mat3(0.0);
+    for (int k = 0; k < 3; ++k) P += w[k] * outerProduct(M[k], M[k]);
+    vec3 b = P * tCam;
+    rayDepthParams[3u * i] = vec4(P[0][0], P[0][1], P[0][2], P[1][1]);
+    rayDepthParams[3u * i + 1u] = vec4(P[1][2], P[2][2], b.x, b.y);
+    rayDepthParams[3u * i + 2u] = vec4(b.z, 0.0, 0.0, 0.0);
+}
+#endif
+
+// The per-gaussian preprocess. Always sets s.depth and s.cullReason; returns the cull reason.
+uint preprocessGaussian(uint i, out Splat s) {
+    s.center = vec2(0.0);
+    s.conicOpacity = vec4(0.0);
+    s.color = vec3(0.0);
+    s.radius = 0.0;
+
+    // 1) Near-plane cull (the only frustum test INRIA does here).
+    vec4 pa = loadPosAlpha(i);
+    vec3 t = (pc.viewInria * vec4(pa.xyz, 1.0)).xyz;
+#ifdef GSR_GPU_CULL
+    // The depth becomes the sort key: compute it exactly like the CPU (viewDepth() in
+    // splat_math.h, same operation order) and `precise` (no fused multiply-add), so GPU
+    // and CPU keys are bit-identical and so are the near-cull decisions.
+    precise float depth =
+        pc.viewInria[0][2] * pa.x + pc.viewInria[1][2] * pa.y + pc.viewInria[2][2] * pa.z + pc.viewInria[3][2];
+    t.z = depth;
+#endif
+    s.depth = t.z;
+#ifdef GSR_GPU_CULL
+    // Same test as the CPU DepthSorter: !(z > near) also drops a NaN depth, which would
+    // otherwise become a NaN sort key.
+    if (!(t.z > kNearCullDepth)) {
+#else
+    if (t.z <= kNearCullDepth) {
+#endif
+        s.cullReason = kCullNearPlane;
+        return s.cullReason;
+    }
+
+#ifdef GSR_GPU_CULL
+    // 1b) Opacity cull: alpha = min(0.99, o * exp(power)) with power <= 0 (the fragment
+    //     shader discards power > 0), so alpha <= o. If o < 1/255 every fragment of this
+    //     splat is discarded by `alpha < 1/255`: drop it before the expensive math.
+    if (pa.w < kMinAlpha) {
+        s.cullReason = kCullLowOpacity;
+        return s.cullReason;
+    }
+#endif
+
+    // 2) 3D covariance -> EWA 2D covariance -> conic and radius.
+    vec3 sigma;
+    vec4 rotation;
+    loadShape(i, sigma, rotation);
+    mat3 cov3D = computeCov3D(sigma, rotation);
+    vec3 cov2D = computeCov2D(t, cov3D, mat3(pc.viewInria), pc.focal, pc.tanHalfFov);
+    vec3 conic;
+    float radius;
+    if (!conicAndRadius(cov2D, conic, radius)) {
+        s.cullReason = kCullSingularCov;
+        return s.cullReason;
+    }
+
+    // 3) Pixel centre and tile rectangle; nothing on screen -> culled. This is the
+    //    frustum cull: the rectangle is the splat's 3-sigma bound clamped to the screen.
+    vec2 center = projectToPixel(t, pc.imageSize, pc.tanHalfFov);
+    uvec2 tiles = (pc.imageSize + uint(kTileSize - 1)) / uint(kTileSize);
+    ivec4 rect = computeTileRect(center, radius, tiles);
+    if ((rect.z - rect.x) * (rect.w - rect.y) == 0) {
+        s.center = center;
+        s.cullReason = kCullOffScreen;
+        return s.cullReason;
+    }
+
+    // 4) SH colour, view direction from the camera to the mean in DATA space.
+    //    Only the coefficients of the evaluated bands are fetched ((degree+1)^2 of K).
+    //    Phase 6: a gaussian may store fewer bands (--sh-threshold): only those are fetched
+    //    and evaluated (the dropped ones are zero, so the sum is the same).
+    vec3 coeffs[16];
+    uint degree = min(pc.shDegree, gaussianShDegree(i));
+    uint used = (degree + 1u) * (degree + 1u);
+    loadSH(i, used, coeffs);
+    vec3 dir = normalize(pa.xyz - pc.camPos.xyz);
+
+    s.center = center;
+    s.conicOpacity = vec4(conic, pa.w);
+    s.color = evalSH(degree, coeffs, dir);
+    s.radius = radius;
+    s.cullReason = kCullVisible;
+#ifdef GSR_TILES
+    if ((pc.flags & kFlagRayDepth) != 0u) writeRayDepth(i, sigma, rotation, t);
+#endif
+    return s.cullReason;
+}
+
+#if !defined(GSR_COMPACT) && !defined(GSR_TILES)
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    Splat s;
+    preprocessGaussian(i, s);
+    splats[i] = s;
+}
+
+#elif defined(GSR_COMPACT)
+
+const uint kNoGaussian = 0xFFFFFFFFu;  // threads past the end of the scene
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint reason = kNoGaussian;
+    Splat s;
+    if (i < pc.count) {
+        reason = preprocessGaussian(i, s);
+        // Culled splats are never read in a sorting frame (they are not in the list).
+        if (reason == kCullVisible || (pc.flags & kFlagWriteAll) != 0u) splats[i] = s;
+    }
+    // From here on every thread of the workgroup participates (no early return above):
+    // subgroup operations need all lanes that are going to vote.
+
+    bool visible = reason == kCullVisible;
+    if ((pc.flags & kFlagAppend) != 0u) {
+        // Stream compaction with a subgroup-aggregated atomic. The ballot is a bit mask of
+        // the lanes that want to append. One elected lane reserves room for all of them
+        // with a single atomicAdd (instead of one atomic per visible thread, which would
+        // serialize up to 32x on the same address), the base is broadcast to the
+        // subgroup, and each lane writes at base + (number of appending lanes below it).
+        uvec4 ballot = subgroupBallot(visible);
+        uint n = subgroupBallotBitCount(ballot);
+        uint base = 0u;
+        if (subgroupElect() && n > 0u) base = atomicAdd(control.instanceCount, n);
+        base = subgroupBroadcastFirst(base);  // the elected lane is the first active lane
+        if (visible) {
+            uint slot = base + subgroupBallotExclusiveBitCount(ballot);
+            // Key: the IEEE-754 bits of the view depth. Visible depths are > 0.2, i.e.
+            // positive, and positive floats order like their bit patterns as uints.
+            sortKeys[slot] = floatBitsToUint(s.depth);
+            sortValues[slot] = i;
+        }
+    }
+
+    // Cull statistics, aggregated the same way: one atomic per subgroup and reason.
+    for (uint r = 0u; r < kCullReasonCount; ++r) {
+        uint n = subgroupBallotBitCount(subgroupBallot(reason == r));
+        if (subgroupElect() && n > 0u) atomicAdd(control.cullCounts[r], n);
+    }
+}
+
+#else  // GSR_TILES
+
+const uint kNoGaussian = 0xFFFFFFFFu;  // threads past the end of the scene
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint reason = kNoGaussian;
+    if (i < pc.count) {
+        Splat s;
+        reason = preprocessGaussian(i, s);
+        uint touched = 0u;
+        if (reason == kCullVisible) {
+            // INRIA preprocessCUDA: tiles_touched = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x).
+            // The duplication pass recomputes the same rectangle from the stored Splat (full)
+            // or reads it from rects[] (packed modes).
+            uvec2 tiles = (pc.imageSize + uint(kTileSize - 1)) / uint(kTileSize);
+            ivec4 rect = computeTileRect(s.center, s.radius, tiles);
+            if (kBoundsMode == kBoundsRect && kBinTileSize == uint(kTileSize)) {
+                touched = uint((rect.z - rect.x) * (rect.w - rect.y));
+            } else {
+                // Phase 6: count the bin tiles of tile_coverage.glsl, from the centre, conic
+                // and opacity exactly as the render (and the duplicate pass) will see them:
+                // p24 stores the conic and opacity in fp16, so count with the decoded values.
+                vec4 co = s.conicOpacity;
+                if (kRenderSplatMode == kRenderSplatP24) co = decodeConicOpacityP24(encodeConicOpacityP24(co));
+                int S = int(kBinTileSize);
+                ivec2 grid = ivec2((pc.imageSize + kBinTileSize - 1u) / kBinTileSize);
+                Coverage cv = makeCoverage(kBoundsMode, rect, S, grid, s.center, co.xyz, co.w);
+                touched = coverageCount(cv, S);
+            }
+            writeRenderSplat(i, s, rect);
+        }
+        tileCounts[i] = touched;
+    }
+    // No early return above: every lane takes part in the ballots.
+    for (uint r = 0u; r < kCullReasonCount; ++r) {
+        uint n = subgroupBallotBitCount(subgroupBallot(reason == r));
+        if (subgroupElect() && n > 0u) atomicAdd(control.cullCounts[r], n);
+    }
+}
+
+#endif

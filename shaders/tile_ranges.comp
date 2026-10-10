@@ -1,0 +1,44 @@
+#version 460
+// Tile rasterizer: per-tile ranges (INRIA identifyTileRanges). After the sort, the
+// entries of each tile are contiguous; one thread per entry k looks at its neighbour:
+//
+//   tile(k-1) != tile(k)  ->  ranges[tile(k-1)].y = k   and   ranges[tile(k)].x = k
+//
+// plus the two ends of the list. Tiles without any entry keep the (0, 0) the per-frame
+// fill wrote (an empty range). Launched with vkCmdDispatchIndirect (ceil(entries / 256)).
+#extension GL_GOOGLE_include_directive : require
+#include "tile_common.glsl"
+
+layout(local_size_x = TILE_RANGES_WG_SIZE) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer TileKeys { uint tileKeys[]; };  // tile id per entry
+layout(std430, set = 0, binding = 1) writeonly buffer Ranges { uvec2 ranges[]; };    // [start, end) per tile
+layout(std430, set = 0, binding = 2) readonly buffer Control { TILE_CONTROL_MEMBERS } control;
+
+layout(push_constant) uniform PushConstants {
+    uint tileCount;  // tiles in the grid: a guard, keys are always < tileCount by construction
+} pc;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    uint n = control.entries;
+    if (k >= n) return;
+    uint tile = tileKeys[k];
+    if (tile >= pc.tileCount) {
+        // Phase 6 sentinel (tile id = tileCount, sorted to the end): written by a duplicate
+        // thread that found no tile for its entry (count/write disagreement; never seen,
+        // counted in TileControl.coverageMismatch). It closes the last real tile's range.
+        if (k > 0u && tileKeys[k - 1u] < pc.tileCount) ranges[tileKeys[k - 1u]].y = k;
+        return;
+    }
+    if (k == 0u) {
+        ranges[tile].x = 0u;
+    } else {
+        uint prev = tileKeys[k - 1u];
+        if (prev != tile) {
+            if (prev < pc.tileCount) ranges[prev].y = k;
+            ranges[tile].x = k;
+        }
+    }
+    if (k == n - 1u) ranges[tile].y = n;
+}

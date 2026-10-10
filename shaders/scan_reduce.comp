@@ -1,0 +1,25 @@
+#version 460
+// Prefix sum, step 1 "reduce": one workgroup per block of SCAN_BLOCK_SIZE elements writes
+// the sum of its block's values to blockSums[block]. See scan_common.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "scan_common.glsl"
+
+layout(local_size_x = SCAN_WG_SIZE) in;
+
+void main() {
+    uint count = scanCount();
+    uint block = gl_WorkGroupID.x;
+    uint blockStart = block * SCAN_BLOCK_SIZE;
+    if (blockStart >= count) return;  // uniform: the workgroup is past the end
+
+    // Coalesced: in iteration i the workgroup reads SCAN_WG_SIZE consecutive elements.
+    uint lane = linearLane();
+    uint sum = 0u;
+    for (uint i = 0u; i < SCAN_ITEMS_PER_THREAD; ++i) {
+        uint j = blockStart + i * SCAN_WG_SIZE + lane;
+        if (j < count) sum += scanValue(j);
+    }
+    uint total;
+    workgroupExclusiveScan(sum, total);  // only the total is needed here
+    if (lane == 0u) blockSums[block] = total;
+}

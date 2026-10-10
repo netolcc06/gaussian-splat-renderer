@@ -1,0 +1,31 @@
+#version 460
+// Tile rasterizer, binning mode: ORDER-PRESERVING stream compaction of the visible splats.
+// One thread per gaussian i. The exclusive scan of the visibility flags (GpuScan with
+// kNonZero over tileCounts) gave slot[i] = number of visible gaussians with a smaller
+// index, so the compact list is in INDEX order (Phase 3's atomic append was not). The
+// stable depth sort that follows then orders ties by index, exactly like the reference.
+//
+//   depthKeys[slot[i]]   = float bits of the view depth (positive, so they sort as uints)
+//   depthValues[slot[i]] = i
+#extension GL_GOOGLE_include_directive : require
+#include "splat_common.glsl"
+#include "tile_common.glsl"
+#include "render_splat.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Splats { Splat splats[]; };
+layout(std430, set = 0, binding = 1) readonly buffer TileCounts { uint tileCounts[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Slots { uint slots[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer DepthKeys { uint depthKeys[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer DepthValues { uint depthValues[]; };
+layout(std430, set = 0, binding = 5) readonly buffer Control { TILE_CONTROL_MEMBERS } control;
+layout(std430, set = 0, binding = 6) readonly buffer Depths { uint depths[]; };  // packed render splats (Phase 5)
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= control.gaussianCount || tileCounts[i] == 0u) return;  // past the end, or culled
+    uint slot = slots[i];
+    depthKeys[slot] = kRenderSplatMode == kRenderSplatFull ? floatBitsToUint(splats[i].depth) : depths[i];
+    depthValues[slot] = i;
+}

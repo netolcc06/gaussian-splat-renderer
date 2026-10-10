@@ -1,0 +1,23 @@
+# Build trees and IDE state
+build/
+build-web/
+tools/web/node_modules/
+out/
+.vs/
+.vscode/
+CMakeUserPresets.json
+
+# Generated shader binaries (built from shaders/*.glsl by glslc)
+*.spv
+*.spv.d
+
+# Scene data is large: keep only tiny samples in git
+/data/*
+!/data/samples/
+!/data/README.md
+# Web demo scene: final outputs only (data/.gitignore drops source/ and work/)
+!/data/demo/
+
+# Runtime by-products
+imgui.ini
+/camera.json

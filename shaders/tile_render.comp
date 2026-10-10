@@ -1,0 +1,400 @@
+#version 460
+// Tile rasterizer: the RENDER pass (INRIA renderCUDA). One workgroup per tile (16x16 by
+// default), one thread per pixel. The tile's splats are ranges[tile] = [start, end) of the
+// sorted list, nearest first. The workgroup walks them in batches (default: one splat per
+// thread, 256):
+//
+//   1. vote: how many pixels of the tile are done? all of them -> the whole tile stops
+//   2. the threads fetch the batch's splats (center, conic+opacity, colour) into shared
+//      memory, so the pixels read each splat from there instead of once per pixel from VRAM
+//   3. each thread blends the batch front to back into its own pixel:
+//        alpha = min(0.99, o * exp(power))   (skip power > 0, skip alpha < 1/255)
+//        test_T = T * (1 - alpha); if test_T < 1e-4: done, and this splat is NOT blended
+//        C += colour * alpha * T; T = test_T
+//
+// exactly as the CPU reference (src/splat/reference_renderer.cpp) and INRIA. The result
+// C + T * background (black) and alpha = 1 - T are stored once per pixel into a storage
+// image; the accumulation itself is fp32 in registers (no per-blend rounding, unlike the
+// RGBA16F blend target of the raster path).
+//
+// Builds: tile_render.comp.spv (rgba16f output), _rgba32f (-DGSR_OUT_RGBA32F), _rgba8
+// (-DGSR_OUT_RGBA8, writes straight into the app's RGBA8 colour target), and _stats
+// (-DGSR_TILE_STATS, rgba16f + per-tile counters for the analysis; never timed).
+// Each again as tile_render_packed*.comp.spv (-DGSR_PACKED_SPLAT, Phase 5): the splats are
+// fetched from the 32- or 24-byte packed render splats (render_splat.glsl, specialization
+// constant kRenderSplatMode) and the colour stays fp16-packed in shared memory until a
+// pixel actually blends it (32 instead of 40 bytes of shared memory per splat).
+//
+// Phase 6:
+//   - tile size = workgroup size = specialization constant 13 (`--tile-size 8|16`)
+//   - batch size (constant 20), whole-tile vote every N batches (constant 21, 0 = never):
+//     profiling experiments (`--render-batch`, `--render-vote-every`), docs/notes/phase6.md
+//   - -DGSR_SHARED_AOS: one struct array in shared memory instead of one array per field
+//   - -DGSR_FP16_MATH: exp/alpha in fp16 (experiment; needs shaderFloat16)
+//   - -DGSR_STOPTHEPOP: per-pixel re-sorting window (StopThePop-style k-buffer, window =
+//     constant 24, `--sort-window K`): each pixel keeps its K nearest pending splats ordered
+//     by the depth of the gaussian's maximum along the PIXEL'S RAY (not the centre depth the
+//     list is sorted by) and blends the nearest one whenever the window overflows.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#ifdef GSR_TILE_STATS
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+#ifdef GSR_FP16_MATH
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+#ifdef GSR_STOPTHEPOP
+#extension GL_EXT_control_flow_attributes : require
+#endif
+#include "splat_common.glsl"
+
+// One workgroup = one tile, one thread per pixel.
+layout(local_size_x_id = 13, local_size_y_id = 13) in;
+const uint kTile = gl_WorkGroupSize.x;
+const uint kThreads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+// Splats per shared-memory batch (the C++ side always sets it; default = kThreads).
+layout(constant_id = 20) const uint kBatch = 256u;
+// Whole-tile early-exit vote every kVoteEvery batches (0 = never: per-pixel exit only).
+layout(constant_id = 21) const uint kVoteEvery = 1u;
+
+#ifdef GSR_PACKED_SPLAT
+#include "render_splat.glsl"
+layout(std430, set = 0, binding = 5) readonly buffer RenderSplats4 { uvec4 renderSplats4[]; };  // p32: 2 per splat
+layout(std430, set = 0, binding = 6) readonly buffer RenderSplats2 { uvec2 renderSplats2[]; };  // p24: 3 per splat
+#else
+layout(std430, set = 0, binding = 0) readonly buffer Splats { Splat splats[]; };
+#endif
+layout(std430, set = 0, binding = 1) readonly buffer TileValues { uint tileValues[]; };  // gaussian index per entry
+layout(std430, set = 0, binding = 2) readonly buffer Ranges { uvec2 ranges[]; };
+#if defined(GSR_OUT_RGBA32F)
+layout(set = 0, binding = 3, rgba32f) uniform writeonly image2D outImage;
+#elif defined(GSR_OUT_RGBA8)
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D outImage;
+#else
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D outImage;
+#endif
+
+#ifdef GSR_TILE_STATS
+// Per tile, kTileStatCount uints (C++ twin: TileStat in splat_tile_renderer.h).
+const uint kStatListLength = 0u;  // entries in the tile's range
+const uint kStatFetched = 1u;     // entries loaded into shared memory before the tile stopped
+const uint kStatEvaluated = 2u;   // (pixel, splat) pairs evaluated (INRIA "contributor" count)
+const uint kStatBlended = 3u;     // pairs actually blended
+const uint kStatTerminated = 4u;  // pixels that reached T < 1e-4
+const uint kStatLaneSlots = 5u;   // SIMD slots: sum over subgroups and batches of max lane iterations x lanes
+const uint kStatMaxDepth = 6u;    // max per-pixel evaluated count in the tile
+const uint kStatPixels = 7u;      // pixels of the tile inside the image
+const uint kTileStatCount = 8u;
+layout(std430, set = 0, binding = 4) buffer TileStats { uint tileStats[]; };
+#endif
+
+#ifdef GSR_STOPTHEPOP
+// Per gaussian: P = Sigma^-1 in INRIA camera space (symmetric: p00 p01 p02 p11 | p12 p22)
+// and b = P mu: the depth of the gaussian's maximum along the ray t v, v = (vx, vy, 1), is
+// t* = (v . b) / (v^T P v). Written by the preprocess (GSR_TILES, kSortWindow > 0).
+layout(std430, set = 0, binding = 7) readonly buffer RayDepthParams { vec4 rayDepthParams[]; };  // 3 per gaussian
+layout(constant_id = 24) const uint kSortWindow = 4u;
+#endif
+
+// C++ twin: RenderPushConstants in splat_tile_renderer.cpp.
+layout(push_constant) uniform PushConstants {
+    uvec2 imageSize;
+    uint tilesX;
+    uint bound;  // 0 = tile (INRIA), 1 = radius: also skip pixels outside the radius square
+    vec2 focal;  // StopThePop: pixel -> camera ray
+} pc;
+
+// --- Shared-memory batch ------------------------------------------------------------------
+#ifdef GSR_PACKED_SPLAT
+#define COLOR_RADIUS_T uvec2  // h(r, g), h(b, 0) | radius << 16 (decoded when blending)
+#else
+#define COLOR_RADIUS_T vec4   // xyz colour, w radius (radius bound)
+#endif
+#ifdef GSR_SHARED_AOS
+struct SharedSplat {
+    vec4 conicOpacity;
+    vec2 center;
+    COLOR_RADIUS_T colorRadius;
+};
+shared SharedSplat sSplat[kBatch];
+#define S_CENTER(j) sSplat[j].center
+#define S_CONIC(j) sSplat[j].conicOpacity
+#define S_COLOR_RADIUS(j) sSplat[j].colorRadius
+#else
+shared vec2 sCenter[kBatch];
+shared vec4 sConicOpacity[kBatch];
+shared COLOR_RADIUS_T sColorRadius[kBatch];
+#define S_CENTER(j) sCenter[j]
+#define S_CONIC(j) sConicOpacity[j]
+#define S_COLOR_RADIUS(j) sColorRadius[j]
+#endif
+#ifdef GSR_PACKED_SPLAT
+vec3 splatColor(uint j) { return colorOf(S_COLOR_RADIUS(j)); }
+float splatRadius(uint j) { return radiusOf(S_COLOR_RADIUS(j)); }
+#else
+vec3 splatColor(uint j) { return S_COLOR_RADIUS(j).xyz; }
+float splatRadius(uint j) { return S_COLOR_RADIUS(j).w; }
+#endif
+#ifdef GSR_STOPTHEPOP
+shared vec4 sRayA[kBatch];  // p00 p01 p02 p11
+shared vec4 sRayB[kBatch];  // p12 p22 b0 b1
+shared float sRayC[kBatch]; // b2
+#endif
+shared uint sDoneCount;
+
+// Loads list entry `entry` into batch slot `slot`.
+void fetchSplat(uint entry, uint slot) {
+    uint g = tileValues[entry];
+#ifdef GSR_PACKED_SPLAT
+    if (kRenderSplatMode == kRenderSplatP32) {
+        uvec4 a = renderSplats4[2u * g], b = renderSplats4[2u * g + 1u];
+        S_CENTER(slot) = uintBitsToFloat(a.xy);
+        S_CONIC(slot) = vec4(uintBitsToFloat(a.zw), uintBitsToFloat(b.xy));
+        S_COLOR_RADIUS(slot) = b.zw;
+    } else {  // p24
+        uvec2 a = renderSplats2[3u * g], b = renderSplats2[3u * g + 1u], c = renderSplats2[3u * g + 2u];
+        vec2 ab = unpackHalf2x16(b.x), co = unpackHalf2x16(b.y);
+        S_CENTER(slot) = uintBitsToFloat(a);
+        S_CONIC(slot) = vec4(ab * (1.0 / kConicScaleP24), co.x * (1.0 / kConicScaleP24), co.y);
+        S_COLOR_RADIUS(slot) = c;
+    }
+#else
+    Splat s = splats[g];
+    S_CENTER(slot) = s.center;
+    S_CONIC(slot) = s.conicOpacity;
+    S_COLOR_RADIUS(slot) = vec4(s.color, s.radius);
+#endif
+#ifdef GSR_STOPTHEPOP
+    sRayA[slot] = rayDepthParams[3u * g];
+    sRayB[slot] = rayDepthParams[3u * g + 1u];
+    sRayC[slot] = rayDepthParams[3u * g + 2u].x;
+#endif
+}
+
+// --- Per-pixel state ----------------------------------------------------------------------
+float T = 1.0;
+vec3 C = vec3(0.0);
+bool done = false;
+#ifdef GSR_TILE_STATS
+uint blended = 0u;
+bool terminated = false;
+#endif
+
+// Front-to-back "over" of one splat into this pixel, INRIA's test-before-accept.
+void blendSplat(float alpha, vec3 color) {
+    float testT = T * (1.0 - alpha);
+    if (testT < 0.0001) {
+        done = true;  // INRIA: this splat is NOT blended; the pixel is finished
+#ifdef GSR_TILE_STATS
+        terminated = true;
+#endif
+        return;
+    }
+    C += color * alpha * T;
+    T = testT;
+#ifdef GSR_TILE_STATS
+    ++blended;
+#endif
+}
+
+#ifdef GSR_STOPTHEPOP
+// The pixel's re-sorting window: kSortWindow slots sorted by ray depth (nearest first);
+// empty slots hold depth = +inf. Every loop has a constant trip count and constant indices
+// ([[unroll]]), so the window stays in registers (a first version with data-dependent
+// indices was spilled to local memory by the compiler: 4-17x slower, see phase6.md).
+// Ties keep the list order (stable).
+const float kEmptySlot = uintBitsToFloat(0x7F800000u);  // +inf
+float qDepth[kSortWindow];
+float qAlpha[kSortWindow];
+vec3 qColor[kSortWindow];
+
+void windowInit() {
+    [[unroll]] for (uint i = 0u; i < kSortWindow; ++i) {
+        qDepth[i] = kEmptySlot;
+        qAlpha[i] = 0.0;
+        qColor[i] = vec3(0.0);
+    }
+}
+
+void windowPush(float depth, float alpha, vec3 color) {
+    if (!(depth < 3.0e38)) depth = 3.0e38;  // finite (NaN/inf from a degenerate splat)
+    if (qDepth[kSortWindow - 1u] == kEmptySlot) {
+        // Not full: insertion from the back (the empty slots move right).
+        bool placed = false;
+        [[unroll]] for (uint i = kSortWindow - 1u; i > 0u; --i) {
+            if (!placed) {
+                if (qDepth[i - 1u] > depth) {
+                    qDepth[i] = qDepth[i - 1u];
+                    qAlpha[i] = qAlpha[i - 1u];
+                    qColor[i] = qColor[i - 1u];
+                } else {
+                    qDepth[i] = depth;
+                    qAlpha[i] = alpha;
+                    qColor[i] = color;
+                    placed = true;
+                }
+            }
+        }
+        if (!placed) {
+            qDepth[0] = depth;
+            qAlpha[0] = alpha;
+            qColor[0] = color;
+        }
+        return;
+    }
+    // Full: the nearest of (window + new) leaves the window and is blended now.
+    if (depth < qDepth[0]) {
+        blendSplat(alpha, color);
+        return;
+    }
+    blendSplat(qAlpha[0], qColor[0]);
+    bool placed = false;
+    [[unroll]] for (uint i = 0u; i + 1u < kSortWindow; ++i) {
+        if (!placed) {
+            if (qDepth[i + 1u] <= depth) {
+                qDepth[i] = qDepth[i + 1u];
+                qAlpha[i] = qAlpha[i + 1u];
+                qColor[i] = qColor[i + 1u];
+            } else {
+                qDepth[i] = depth;
+                qAlpha[i] = alpha;
+                qColor[i] = color;
+                placed = true;
+            }
+        }
+    }
+    if (!placed) {
+        qDepth[kSortWindow - 1u] = depth;
+        qAlpha[kSortWindow - 1u] = alpha;
+        qColor[kSortWindow - 1u] = color;
+    }
+}
+
+// End of the list: blend what is left, nearest first.
+void windowFlush() {
+    [[unroll]] for (uint i = 0u; i < kSortWindow; ++i)
+        if (!done && qDepth[i] != kEmptySlot) blendSplat(qAlpha[i], qColor[i]);
+}
+#endif
+
+void main() {
+    uvec2 tileXY = gl_WorkGroupID.xy;
+    uint tile = tileXY.y * pc.tilesX + tileXY.x;
+    uvec2 pix = tileXY * kTile + gl_LocalInvocationID.xy;
+    vec2 pixf = vec2(pix);  // INRIA pixel coordinates: the centre of pixel (i, j) is (i, j)
+    uint t = gl_LocalInvocationIndex;
+    bool inside = pix.x < pc.imageSize.x && pix.y < pc.imageSize.y;
+    // Pixels outside the image (right/bottom edge tiles) still help fetch, but never blend.
+    done = !inside;
+#ifdef GSR_STOPTHEPOP
+    // The pixel's camera ray t * (vx, vy, 1) (INRIA camera space; pixel = f x/z + (size-1)/2).
+    vec2 ray = (pixf - 0.5 * (vec2(pc.imageSize) - 1.0)) / pc.focal;
+    windowInit();
+#endif
+
+    uvec2 range = ranges[tile];
+    uint total = range.y - range.x;
+    uint rounds = (total + kBatch - 1u) / kBatch;
+
+#ifdef GSR_TILE_STATS
+    uint evaluated = 0u, laneSlots = 0u, fetched = 0u;
+#endif
+
+    if (t == 0u) sDoneCount = 0u;
+    barrier();
+
+    for (uint round = 0u; round < rounds; ++round) {
+        // 1. Whole-tile early exit (INRIA: __syncthreads_count(done) == BLOCK_SIZE).
+        //    One atomic per subgroup with the ballot count of its finished pixels.
+        bool vote = kVoteEvery != 0u && round % kVoteEvery == 0u;  // uniform
+        if (vote) {
+            uvec4 doneBallot = subgroupBallot(done);
+            if (subgroupElect()) atomicAdd(sDoneCount, subgroupBallotBitCount(doneBallot));
+            barrier();
+            if (sDoneCount == kThreads) break;  // the same value for every thread: uniform exit
+        }
+
+        // 2. Cooperative fetch of this batch into shared memory.
+        uint first = range.x + round * kBatch;
+        for (uint slot = t; slot < kBatch; slot += kThreads)
+            if (first + slot < range.y) fetchSplat(first + slot, slot);
+        barrier();  // the batch is visible; every thread has also read sDoneCount by now
+        if (vote && t == 0u) sDoneCount = 0u;  // re-armed for the next vote (after the barrier below)
+
+        // 3. Front-to-back blending of the batch into this thread's pixel.
+        uint batch = min(kBatch, total - round * kBatch);
+#ifdef GSR_TILE_STATS
+        fetched += batch;
+        uint iterations = 0u;
+#endif
+        for (uint j = 0u; !done && j < batch; ++j) {
+#ifdef GSR_TILE_STATS
+            ++iterations;
+#endif
+            vec2 center = S_CENTER(j);
+            if (pc.bound == 1u) {
+                // CoverageBound::Radius (insideRadiusSquare in splat_math.h).
+                float r = splatRadius(j);
+                vec2 p = pixf + 0.5, c = center + 0.5;
+                if (!(p.x >= c.x - r && p.x < c.x + r && p.y >= c.y - r && p.y < c.y + r)) continue;
+            }
+#ifdef GSR_TILE_STATS
+            ++evaluated;
+#endif
+            vec2 d = center - pixf;
+            vec4 co = S_CONIC(j);
+            float power = -0.5 * (co.x * d.x * d.x + co.z * d.y * d.y) - co.y * d.x * d.y;
+            if (power > 0.0) continue;
+#ifdef GSR_FP16_MATH
+            float16_t alpha16 = min(float16_t(kMaxAlpha), float16_t(co.w) * exp(float16_t(power)));
+            if (alpha16 < float16_t(kMinAlpha)) continue;
+            float alpha = float(alpha16);
+#else
+            float alpha = min(kMaxAlpha, co.w * exp(power));
+            if (alpha < kMinAlpha) continue;
+#endif
+#ifdef GSR_STOPTHEPOP
+            vec4 pa = sRayA[j], pb = sRayB[j];
+            float vPv = pa.x * ray.x * ray.x + 2.0 * pa.y * ray.x * ray.y + 2.0 * pa.z * ray.x + pa.w * ray.y * ray.y +
+                        2.0 * pb.x * ray.y + pb.y;
+            float vb = pb.z * ray.x + pb.w * ray.y + sRayC[j];
+            float depth = vb / vPv;
+            windowPush(depth, alpha, splatColor(j));
+#else
+            blendSplat(alpha, splatColor(j));
+#endif
+        }
+#ifdef GSR_TILE_STATS
+        // A subgroup runs the loop until its slowest lane leaves it.
+        laneSlots += subgroupMax(iterations) * gl_SubgroupSize;
+#endif
+        barrier();  // nobody may overwrite the batch while another thread still reads it
+    }
+#ifdef GSR_STOPTHEPOP
+    windowFlush();
+#endif
+
+    if (inside) imageStore(outImage, ivec2(pix), vec4(C, 1.0 - T));  // + T * background (black)
+
+#ifdef GSR_TILE_STATS
+    uint base = tile * kTileStatCount;
+    uint sumEvaluated = subgroupAdd(evaluated);
+    uint sumBlended = subgroupAdd(blended);
+    uint sumTerminated = subgroupAdd(terminated ? 1u : 0u);
+    uint sumInside = subgroupAdd(inside ? 1u : 0u);
+    uint maxDepth = subgroupMax(evaluated);
+    if (subgroupElect()) {
+        atomicAdd(tileStats[base + kStatEvaluated], sumEvaluated);
+        atomicAdd(tileStats[base + kStatBlended], sumBlended);
+        atomicAdd(tileStats[base + kStatTerminated], sumTerminated);
+        atomicAdd(tileStats[base + kStatLaneSlots], laneSlots);
+        atomicMax(tileStats[base + kStatMaxDepth], maxDepth);
+        atomicAdd(tileStats[base + kStatPixels], sumInside);
+    }
+    if (t == 0u) {
+        tileStats[base + kStatListLength] = range.y - range.x;
+        tileStats[base + kStatFetched] = fetched;
+    }
+#endif
+}

@@ -1,0 +1,223 @@
+#version 460
+// Tile rasterizer: DUPLICATION. Every visible splat emits one entry per tile of its tile
+// rectangle, at the offset the prefix sum of the touched-tile counts gave it (INRIA
+// duplicateWithKeys). Because the offsets come from a scan (not an atomic append), the
+// entries appear in a deterministic order: the order of the scan's input.
+//
+// Two builds:
+//   tile_duplicate.comp.spv         binning mode (default). One thread per entry j of the
+//                                   DEPTH-SORTED visible list; key = tile id only. The list
+//                                   is already in (depth, index) order, so a STABLE sort by
+//                                   tile afterwards gives per-tile lists in (depth, index)
+//                                   order: only log2(#tiles) key bits to sort.
+//   tile_duplicate_global.comp.spv  global mode (-DGSR_TILE_GLOBAL64), INRIA's scheme. One
+//                                   thread per gaussian i (index order); 64-bit key
+//                                   (tile << 32 | depth bits) as two words. One sort over
+//                                   32 + log2(#tiles) bits does all the ordering.
+//
+// Thread mapping (orthogonal to the two builds above):
+//   per splat (default here; INRIA's mapping): one thread per splat writes all its
+//            entries in a loop. Simple, but badly load-balanced: one huge splat (thousands
+//            of tiles) keeps its thread, and so its whole subgroup, busy for a long time,
+//            and the 32 lanes of a subgroup write 32 scattered runs.
+//   per entry (-DGSR_DUPLICATE_PER_ENTRY, `--tile-duplicate per-entry`): one thread per
+//            OUTPUT entry k (indirect dispatch over min(M, capacity)). The thread finds its
+//            splat by a binary search in the offsets (the last j with offsets[j] <= k: an
+//            "upper bound" search; gaussians with zero tiles share the next one's offset and
+//            are skipped automatically), then its tile from k - offsets[j] within the
+//            rectangle. Every thread does the same small amount of work and consecutive
+//            threads write consecutive entries (coalesced). Same output, bit for bit.
+//
+// Entries at offsets >= capacity are dropped (the overflow is counted by tile_setup.comp):
+// the list is clamped instead of writing out of bounds.
+//
+// Phase 6 (`--bounds tight|cutoff-only`, `--tile-size 8`): a splat's tiles are no longer a
+// full rectangle but one contiguous run per tile row (tile_coverage.glsl). Entry r of a
+// splat is found by walking its rows and summing the run lengths; per splat, the loop runs
+// over the rows. Both use the same functions, on the same inputs, as the preprocess's
+// count, so they write exactly tileCounts[g] entries; the thread of the splat's first entry
+// re-checks the total and counts a disagreement in control.coverageMismatch (never seen).
+// A thread that finds no tile writes the sentinel tile id = #tiles, which sorts last and
+// which tile_ranges.comp ignores.
+#extension GL_GOOGLE_include_directive : require
+#include "splat_common.glsl"
+#include "tile_common.glsl"
+#include "render_splat.glsl"
+#include "tile_coverage.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Splats { Splat splats[]; };
+layout(std430, set = 0, binding = 1) readonly buffer SortedOrder { uint sortedOrder[]; };  // binning: depth-sorted indices
+layout(std430, set = 0, binding = 2) readonly buffer TileCounts { uint tileCounts[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Offsets { uint offsets[]; };          // exclusive scan
+layout(std430, set = 0, binding = 4) writeonly buffer KeysOut { uint keysOut[]; };         // tile id | depth bits (global)
+layout(std430, set = 0, binding = 5) writeonly buffer KeysHiOut { uint keysHiOut[]; };     // global: tile id
+layout(std430, set = 0, binding = 6) writeonly buffer ValuesOut { uint valuesOut[]; };     // gaussian index
+layout(std430, set = 0, binding = 7) buffer Control { TILE_CONTROL_MEMBERS } control;
+// Phase 5 packed render splats: the tile rectangle and depth have their own arrays, so this
+// pass reads 8 (+ 4 in global mode) bytes per entry instead of a 48-byte Splat.
+layout(std430, set = 0, binding = 8) readonly buffer Rects { uvec2 rects[]; };
+layout(std430, set = 0, binding = 9) readonly buffer Depths { uint depths[]; };
+// Phase 6, tight/cutoff-only bounds with packed render splats: centre, conic and opacity.
+layout(std430, set = 0, binding = 10) readonly buffer RenderSplats4 { uvec4 renderSplats4[]; };  // p32
+layout(std430, set = 0, binding = 11) readonly buffer RenderSplats2 { uvec2 renderSplats2[]; };  // p24
+
+layout(push_constant) uniform PushConstants {
+    uvec2 tiles;    // the BIN tile grid (ceil(size / kBinTileSize))
+    uint capacity;  // entries the output buffers can hold
+    uint pad;
+    uvec2 tiles16;  // INRIA's 16-px tile grid (getRect)
+} pc;
+
+const bool kRectOnly = kBoundsMode == kBoundsRect && kBinTileSize == 16u;  // the Phase 4 path
+
+// Tile rectangle (16-px tiles) and view depth of visible splat g.
+void rectAndDepth(uint g, out ivec4 rect, out float depth) {
+    if (kRenderSplatMode == kRenderSplatFull) {
+        Splat s = splats[g];
+        rect = computeTileRect(s.center, s.radius, pc.tiles16);
+        depth = s.depth;
+    } else {
+        rect = unpackRect(rects[g]);
+        depth = uintBitsToFloat(depths[g]);
+    }
+}
+
+// The bin tiles of splat g (tile_coverage.glsl), from what the render pass will see.
+Coverage coverageOf(uint g, ivec4 rect16) {
+    vec2 center = vec2(0.0);
+    vec4 co = vec4(0.0);
+    if (kBoundsMode != kBoundsRect) {
+        if (kRenderSplatMode == kRenderSplatFull) {
+            center = splats[g].center;
+            co = splats[g].conicOpacity;
+        } else if (kRenderSplatMode == kRenderSplatP32) {
+            uvec4 a = renderSplats4[2u * g], b = renderSplats4[2u * g + 1u];
+            center = uintBitsToFloat(a.xy);
+            co = vec4(uintBitsToFloat(a.zw), uintBitsToFloat(b.xy));
+        } else {
+            center = uintBitsToFloat(renderSplats2[3u * g]);
+            co = decodeConicOpacityP24(renderSplats2[3u * g + 1u]);
+        }
+    }
+    return makeCoverage(kBoundsMode, rect16, int(kBinTileSize), ivec2(pc.tiles), center, co.xyz, co.w);
+}
+
+void writeEntry(uint k, uint tile, uint g, float depth) {
+#ifdef GSR_TILE_GLOBAL64
+    keysOut[k] = floatBitsToUint(depth);  // low word: depth, sorted by the first 4 passes
+    keysHiOut[k] = tile;                  // high word: tile, sorted last (most significant)
+#else
+    keysOut[k] = tile;
+#endif
+    valuesOut[k] = g;
+}
+
+#ifdef GSR_DUPLICATE_PER_ENTRY
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= control.entries) return;
+#ifdef GSR_TILE_GLOBAL64
+    uint n = control.gaussianCount;  // offsets of every gaussian, index order
+#else
+    uint n = control.visible;        // offsets of the depth-sorted visible splats
+#endif
+    // Last j with offsets[j] <= k. offsets[0] = 0 <= k, so the answer is in [lo, hi).
+    uint lo = 0u, hi = n;
+    while (hi - lo > 1u) {
+        uint mid = (lo + hi) >> 1;
+        if (offsets[mid] <= k) lo = mid;
+        else hi = mid;
+    }
+#ifdef GSR_TILE_GLOBAL64
+    uint g = lo;
+#else
+    uint g = sortedOrder[lo];
+#endif
+    ivec4 rect;
+    float depth;
+    rectAndDepth(g, rect, depth);
+    uint r = k - offsets[lo];  // my entry within the splat's tiles, row by row
+    if (kRectOnly) {
+        uint w = uint(rect.z - rect.x);
+        if (w == 0u || r >= w * uint(rect.w - rect.y)) return;  // cannot happen (same rectangle as the count)
+        uint tile = (uint(rect.y) + r / w) * pc.tiles.x + uint(rect.x) + r % w;
+        writeEntry(k, tile, g, depth);
+        return;
+    }
+    // Phase 6: walk the splat's tile rows until the r-th tile.
+    int S = int(kBinTileSize);
+    Coverage cv = coverageOf(g, rect);
+    ivec2 rows = coverageRows(cv, S);
+    uint tile = pc.tiles.x * pc.tiles.y;  // sentinel: not found
+    if (!cv.useEllipse) {
+        uint w = uint(max(0, cv.bins.z - cv.bins.x));
+        if (w > 0u && r < w * uint(rows.y - rows.x)) tile = (uint(rows.x) + r / w) * pc.tiles.x + uint(cv.bins.x) + r % w;
+    } else {
+        uint before = 0u;
+        for (int row = rows.x; row < rows.y; ++row) {
+            ivec2 span = ellipseRowSpan(cv.e, row, S, cv.bins);
+            uint w = uint(span.y - span.x);
+            if (r < before + w) {
+                tile = uint(row) * pc.tiles.x + uint(span.x) + (r - before);
+                break;
+            }
+            before += w;
+        }
+    }
+    // Count/write agreement check, once per splat (by its first entry).
+    if (r == 0u && coverageCount(cv, S) != tileCounts[g]) atomicAdd(control.coverageMismatch, 1u);
+    writeEntry(k, tile, g, depth);
+}
+
+#else  // one thread per splat
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+#ifdef GSR_TILE_GLOBAL64
+    if (j >= control.gaussianCount) return;
+    uint g = j;  // gaussian index
+#else
+    if (j >= control.visible) return;
+    uint g = sortedOrder[j];
+#endif
+    uint count = tileCounts[g];
+    if (count == 0u) return;  // culled (global mode visits every gaussian)
+    ivec4 rect;
+    float depth;
+    rectAndDepth(g, rect, depth);
+
+    uint off = offsets[j];
+    uint end = min(off + count, pc.capacity);  // never more than the scan reserved, never past the buffer
+    if (kRectOnly) {
+        for (int y = rect.y; y < rect.w; ++y) {
+            for (int x = rect.x; x < rect.z; ++x) {
+                if (off >= end) return;
+                writeEntry(off, uint(y) * pc.tiles.x + uint(x), g, depth);
+                ++off;
+            }
+        }
+        return;
+    }
+    // Phase 6: the splat's run of tiles in each row.
+    int S = int(kBinTileSize);
+    Coverage cv = coverageOf(g, rect);
+    ivec2 rows = coverageRows(cv, S);
+    uint written = 0u;
+    for (int y = rows.x; y < rows.y; ++y) {
+        ivec2 span = coverageRowSpan(cv, y, S);
+        for (int x = span.x; x < span.y; ++x) {
+            if (written < count && off < end) writeEntry(off, uint(y) * pc.tiles.x + uint(x), g, depth);
+            ++off;
+            ++written;
+        }
+    }
+    if (written != count) atomicAdd(control.coverageMismatch, 1u);
+    // Fewer tiles than reserved (never seen): fill the rest with the sentinel tile.
+    for (; written < count; ++written, ++off)
+        if (off < end) writeEntry(off, pc.tiles.x * pc.tiles.y, g, depth);
+}
+
+#endif  // GSR_DUPLICATE_PER_ENTRY

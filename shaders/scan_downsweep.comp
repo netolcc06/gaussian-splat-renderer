@@ -1,0 +1,38 @@
+#version 460
+// Prefix sum, step 3 "downsweep": one workgroup per block computes the exclusive scan of
+// its block and adds the block's offset (blockSums[block] after scan_blocks):
+//
+//   thread t owns the SCAN_ITEMS_PER_THREAD CONSECUTIVE elements [t*8, t*8 + 8) of the
+//   block, so a workgroup scan of the per-thread sums gives each thread the sum of all
+//   elements before its own run; the thread then walks its run sequentially.
+//
+// Threads are numbered in subgroup-lane order (linearLane), the order the subgroup scan
+// inside workgroupExclusiveScan uses. See scan_common.glsl.
+#extension GL_GOOGLE_include_directive : require
+#include "scan_common.glsl"
+
+layout(local_size_x = SCAN_WG_SIZE) in;
+
+void main() {
+    uint count = scanCount();
+    uint block = gl_WorkGroupID.x;
+    uint blockStart = block * SCAN_BLOCK_SIZE;
+    if (blockStart >= count) return;  // uniform
+
+    uint lane = linearLane();
+    uint first = blockStart + lane * SCAN_ITEMS_PER_THREAD;
+    uint values[SCAN_ITEMS_PER_THREAD];
+    uint sum = 0u;
+    for (uint i = 0u; i < SCAN_ITEMS_PER_THREAD; ++i) {
+        uint j = first + i;
+        values[i] = j < count ? scanValue(j) : 0u;
+        sum += values[i];
+    }
+    uint total;
+    uint running = blockSums[block] + workgroupExclusiveScan(sum, total);
+    for (uint i = 0u; i < SCAN_ITEMS_PER_THREAD; ++i) {
+        uint j = first + i;
+        if (j < count) scanOutput[j] = running;
+        running += values[i];
+    }
+}
